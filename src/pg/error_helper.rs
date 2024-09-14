@@ -57,39 +57,39 @@ pub(super) fn from_tokio_postgres_error(
     // }
 }
 
-struct PostgresDbErrorWrapper(xitca_postgres::error::DbError);
+// struct PostgresDbErrorWrapper(xitca_postgres::error::DbError);
 
-impl diesel::result::DatabaseErrorInformation for PostgresDbErrorWrapper {
-    fn message(&self) -> &str {
-        self.0.message()
-    }
+// impl diesel::result::DatabaseErrorInformation for PostgresDbErrorWrapper {
+//     fn message(&self) -> &str {
+//         self.0.message()
+//     }
 
-    fn details(&self) -> Option<&str> {
-        self.0.detail()
-    }
+//     fn details(&self) -> Option<&str> {
+//         self.0.detail()
+//     }
 
-    fn hint(&self) -> Option<&str> {
-        self.0.hint()
-    }
+//     fn hint(&self) -> Option<&str> {
+//         self.0.hint()
+//     }
 
-    fn table_name(&self) -> Option<&str> {
-        self.0.table()
-    }
+//     fn table_name(&self) -> Option<&str> {
+//         self.0.table()
+//     }
 
-    fn column_name(&self) -> Option<&str> {
-        self.0.column()
-    }
+//     fn column_name(&self) -> Option<&str> {
+//         self.0.column()
+//     }
 
-    fn constraint_name(&self) -> Option<&str> {
-        self.0.constraint()
-    }
+//     fn constraint_name(&self) -> Option<&str> {
+//         self.0.constraint()
+//     }
 
-    fn statement_position(&self) -> Option<i32> {
-        use xitca_postgres::error::ErrorPosition;
-        self.0.position().map(|e| match e {
-            ErrorPosition::Original(position) | ErrorPosition::Internal { position, .. } => {
-                *position as i32
-            }
-        })
-    }
-}
+//     fn statement_position(&self) -> Option<i32> {
+//         use xitca_postgres::error::ErrorPosition;
+//         self.0.position().map(|e| match e {
+//             ErrorPosition::Original(position) | ErrorPosition::Internal { position, .. } => {
+//                 *position as i32
+//             }
+//         })
+//     }
+// }
