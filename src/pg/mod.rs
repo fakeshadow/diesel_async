@@ -29,13 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::future::IntoFuture;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use xitca_postgres::compat::RowStreamOwned;
-use xitca_postgres::{
-    statement::Statement,
-    types::{ToSql, Type},
-};
+use xitca_postgres::types::{ToSql, Type};
 
 pub use self::transaction_builder::TransactionBuilder;
 
@@ -45,6 +41,8 @@ mod serialize;
 mod transaction_builder;
 
 const FAKE_OID: u32 = 0;
+
+type Statement = xitca_postgres::compat::StatementGuarded<Arc<xitca_postgres::Client>>;
 
 /// A connection to a PostgreSQL database.
 ///
@@ -115,7 +113,6 @@ pub struct AsyncPgConnection {
     transaction_state: Arc<Mutex<AnsiTransactionManager>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
     connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
-    shutdown_channel: Option<oneshot::Sender<()>>,
     // a sync mutex is fine here as we only hold it for a really short time
     instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
 }
@@ -161,23 +158,13 @@ impl AsyncConnection for AsyncPgConnection {
             .await
             .map_err(ErrorHelper)?;
         let (tx, rx) = tokio::sync::broadcast::channel(1);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            match futures_util::future::select(shutdown_rx, driver.into_future()).await {
-                Either::Left(_) | Either::Right((Ok(_), _)) => {}
-                Either::Right((Err(e), _)) => {
-                    let _ = tx.send(Arc::new(e));
-                }
+            if let Err(e) = driver.into_future().await {
+                let _ = tx.send(Arc::new(e));
             }
         });
 
-        let r = Self::setup(
-            client,
-            Some(rx),
-            Some(shutdown_tx),
-            Arc::clone(&instrumentation),
-        )
-        .await;
+        let r = Self::setup(client, Some(rx), Arc::clone(&instrumentation)).await;
         instrumentation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -237,20 +224,12 @@ impl AsyncConnection for AsyncPgConnection {
     }
 }
 
-impl Drop for AsyncPgConnection {
-    fn drop(&mut self) {
-        if let Some(tx) = self.shutdown_channel.take() {
-            let _ = tx.send(());
-        }
-    }
-}
-
 async fn load_prepared(
     conn: Arc<xitca_postgres::Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
 ) -> QueryResult<BoxStream<'static, QueryResult<PgRow>>> {
-    let res = conn.query_raw(&stmt, binds).map_err(ErrorHelper)?;
+    let res = conn.query_raw(stmt.as_ref(), binds).map_err(ErrorHelper)?;
     Ok(RowStreamOwned::from(res)
         .map_err(|e| diesel::result::Error::from(ErrorHelper(e)))
         .map_ok(PgRow::new)
@@ -267,7 +246,7 @@ async fn execute_prepared(
         .map(|b| b as &(dyn ToSql + Sync))
         .collect::<Vec<_>>();
 
-    let res = xitca_postgres::Client::execute(&conn, &stmt, &binds)
+    let res = xitca_postgres::Client::execute(&conn, stmt.as_ref(), &binds)
         .await
         .map_err(ErrorHelper)?;
     Ok(res as usize)
@@ -301,13 +280,14 @@ impl PrepareCallback<Statement, PgTypeMetadata> for Arc<xitca_postgres::Client> 
             .map(type_from_oid)
             .collect::<QueryResult<Vec<_>>>()?;
 
-        // the statement is leaked and will not be canceled unless it's converted back into
-        // StatementGuarded
         let stmt = xitca_postgres::Client::prepare(&self, sql, &bind_types)
             .await
             .map_err(ErrorHelper)?
             .leak();
-        Ok((stmt, self))
+        Ok((
+            xitca_postgres::compat::StatementGuarded::new(stmt, self.clone()),
+            self,
+        ))
     }
 }
 
@@ -364,7 +344,6 @@ impl AsyncPgConnection {
         Self::setup(
             conn,
             None,
-            None,
             Arc::new(std::sync::Mutex::new(
                 diesel::connection::get_default_instrumentation(),
             )),
@@ -375,7 +354,6 @@ impl AsyncPgConnection {
     async fn setup(
         conn: xitca_postgres::Client,
         connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
-        shutdown_channel: Option<oneshot::Sender<()>>,
         instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
     ) -> ConnectionResult<Self> {
         let mut conn = Self {
@@ -384,7 +362,6 @@ impl AsyncPgConnection {
             transaction_state: Arc::new(Mutex::new(AnsiTransactionManager::default())),
             metadata_cache: Arc::new(Mutex::new(PgMetadataCache::new())),
             connection_future,
-            shutdown_channel,
             instrumentation,
         };
         conn.set_config_options()
