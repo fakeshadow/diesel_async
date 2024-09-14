@@ -1,14 +1,14 @@
 use diesel::backend::Backend;
 use diesel::row::{Field, PartialRow, RowIndex, RowSealed};
 use std::{error::Error, num::NonZeroU32};
-use tokio_postgres::{types::Type, Row};
+use xitca_postgres::{compat::RowOwned, types::Type};
 
 pub struct PgRow {
-    row: Row,
+    row: RowOwned,
 }
 
 impl PgRow {
-    pub(super) fn new(row: Row) -> Self {
+    pub(super) fn new(row: RowOwned) -> Self {
         Self { row }
     }
 }
@@ -59,7 +59,7 @@ impl<'a> RowIndex<&'a str> for PgRow {
 }
 
 pub struct PgField<'a> {
-    row: &'a Row,
+    row: &'a RowOwned,
     idx: usize,
 }
 
@@ -85,7 +85,7 @@ impl diesel::pg::TypeOidLookup for TyWrapper {
 
 struct DieselFromSqlWrapper<'a>(Option<diesel::pg::PgValue<'a>>);
 
-impl<'a> tokio_postgres::types::FromSql<'a> for DieselFromSqlWrapper<'a> {
+impl<'a> xitca_postgres::types::FromSql<'a> for DieselFromSqlWrapper<'a> {
     fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + 'static + Send + Sync>> {
         let ty = unsafe { &*(ty as *const Type as *const TyWrapper) };
         Ok(DieselFromSqlWrapper(Some(diesel::pg::PgValue::new(

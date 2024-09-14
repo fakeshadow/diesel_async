@@ -1,10 +1,10 @@
 use diesel::pg::PgTypeMetadata;
-use tokio_postgres::types::{private::BytesMut, IsNull, Type, WrongType};
+use xitca_postgres::types::{private::BytesMut, IsNull, Type, WrongType};
 
 #[derive(Debug)]
 pub(super) struct ToSqlHelper(pub(super) PgTypeMetadata, pub(super) Option<Vec<u8>>);
 
-impl tokio_postgres::types::ToSql for ToSqlHelper {
+impl xitca_postgres::types::ToSql for ToSqlHelper {
     fn to_sql(
         &self,
         _ty: &Type,

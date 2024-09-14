@@ -26,13 +26,16 @@ use futures_util::stream::{BoxStream, TryStreamExt};
 use futures_util::TryFutureExt;
 use futures_util::{Future, FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::future::IntoFuture;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
-use tokio_postgres::types::ToSql;
-use tokio_postgres::types::Type;
-use tokio_postgres::Statement;
+use xitca_postgres::compat::RowStreamOwned;
+use xitca_postgres::{
+    statement::Statement,
+    types::{ToSql, Type},
+};
 
 pub use self::transaction_builder::TransactionBuilder;
 
@@ -107,11 +110,11 @@ const FAKE_OID: u32 = 0;
 ///       # Ok(())
 /// # }
 pub struct AsyncPgConnection {
-    conn: Arc<tokio_postgres::Client>,
+    conn: Arc<xitca_postgres::Client>,
     stmt_cache: Arc<Mutex<StmtCache<diesel::pg::Pg, Statement>>>,
     transaction_state: Arc<Mutex<AnsiTransactionManager>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
-    connection_future: Option<broadcast::Receiver<Arc<tokio_postgres::Error>>>,
+    connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
     shutdown_channel: Option<oneshot::Sender<()>>,
     // a sync mutex is fine here as we only hold it for a really short time
     instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
@@ -126,7 +129,7 @@ impl SimpleAsyncConnection for AsyncPgConnection {
         let connection_future = self.connection_future.as_ref().map(|rx| rx.resubscribe());
         let batch_execute = self
             .conn
-            .batch_execute(query)
+            .execute_simple(query)
             .map_err(ErrorHelper)
             .map_err(Into::into);
         let r = drive_future(connection_future, batch_execute).await;
@@ -134,7 +137,7 @@ impl SimpleAsyncConnection for AsyncPgConnection {
             &StrQueryHelper::new(query),
             r.as_ref().err(),
         ));
-        r
+        r.map(|_| ())
     }
 }
 
@@ -153,13 +156,14 @@ impl AsyncConnection for AsyncPgConnection {
             database_url,
         ));
         let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation));
-        let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        let (client, driver) = xitca_postgres::Postgres::new(database_url)
+            .connect()
             .await
             .map_err(ErrorHelper)?;
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            match futures_util::future::select(shutdown_rx, connection).await {
+            match futures_util::future::select(shutdown_rx, driver.into_future()).await {
                 Either::Left(_) | Either::Right((Ok(_), _)) => {}
                 Either::Right((Err(e), _)) => {
                     let _ = tx.send(Arc::new(e));
@@ -242,20 +246,19 @@ impl Drop for AsyncPgConnection {
 }
 
 async fn load_prepared(
-    conn: Arc<tokio_postgres::Client>,
+    conn: Arc<xitca_postgres::Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
 ) -> QueryResult<BoxStream<'static, QueryResult<PgRow>>> {
-    let res = conn.query_raw(&stmt, binds).await.map_err(ErrorHelper)?;
-
-    Ok(res
+    let res = conn.query_raw(&stmt, binds).map_err(ErrorHelper)?;
+    Ok(RowStreamOwned::from(res)
         .map_err(|e| diesel::result::Error::from(ErrorHelper(e)))
         .map_ok(PgRow::new)
         .boxed())
 }
 
 async fn execute_prepared(
-    conn: Arc<tokio_postgres::Client>,
+    conn: Arc<xitca_postgres::Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
 ) -> QueryResult<usize> {
@@ -264,7 +267,7 @@ async fn execute_prepared(
         .map(|b| b as &(dyn ToSql + Sync))
         .collect::<Vec<_>>();
 
-    let res = tokio_postgres::Client::execute(&conn, &stmt, &binds as &[_])
+    let res = xitca_postgres::Client::execute(&conn, &stmt, &binds)
         .await
         .map_err(ErrorHelper)?;
     Ok(res as usize)
@@ -286,7 +289,7 @@ fn update_transaction_manager_status<T>(
 }
 
 #[async_trait::async_trait]
-impl PrepareCallback<Statement, PgTypeMetadata> for Arc<tokio_postgres::Client> {
+impl PrepareCallback<Statement, PgTypeMetadata> for Arc<xitca_postgres::Client> {
     async fn prepare(
         self,
         sql: &str,
@@ -298,11 +301,13 @@ impl PrepareCallback<Statement, PgTypeMetadata> for Arc<tokio_postgres::Client> 
             .map(type_from_oid)
             .collect::<QueryResult<Vec<_>>>()?;
 
-        let stmt = self
-            .prepare_typed(sql, &bind_types)
+        // the statement is leaked and will not be canceled unless it's converted back into
+        // StatementGuarded
+        let stmt = xitca_postgres::Client::prepare(&self, sql, &bind_types)
             .await
-            .map_err(ErrorHelper);
-        Ok((stmt?, self))
+            .map_err(ErrorHelper)?
+            .leak();
+        Ok((stmt, self))
     }
 }
 
@@ -318,7 +323,7 @@ fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
     Ok(Type::new(
         format!("diesel_custom_type_{oid}"),
         oid,
-        tokio_postgres::types::Kind::Simple,
+        xitca_postgres::types::Kind::Simple,
         "public".into(),
     ))
 }
@@ -355,7 +360,7 @@ impl AsyncPgConnection {
     }
 
     /// Construct a new `AsyncPgConnection` instance from an existing [`tokio_postgres::Client`]
-    pub async fn try_from(conn: tokio_postgres::Client) -> ConnectionResult<Self> {
+    pub async fn try_from(conn: xitca_postgres::Client) -> ConnectionResult<Self> {
         Self::setup(
             conn,
             None,
@@ -368,8 +373,8 @@ impl AsyncPgConnection {
     }
 
     async fn setup(
-        conn: tokio_postgres::Client,
-        connection_future: Option<broadcast::Receiver<Arc<tokio_postgres::Error>>>,
+        conn: xitca_postgres::Client,
+        connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
         shutdown_channel: Option<oneshot::Sender<()>>,
         instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
     ) -> ConnectionResult<Self> {
@@ -389,7 +394,7 @@ impl AsyncPgConnection {
     }
 
     /// Constructs a cancellation token that can later be used to request cancellation of a query running on the connection associated with this client.
-    pub fn cancel_token(&self) -> tokio_postgres::CancelToken {
+    pub fn cancel_token(&self) -> xitca_postgres::Session {
         self.conn.cancel_token()
     }
 
@@ -414,7 +419,7 @@ impl AsyncPgConnection {
     fn with_prepared_statement<'a, T, F, R>(
         &mut self,
         query: T,
-        callback: fn(Arc<tokio_postgres::Client>, Statement, Vec<ToSqlHelper>) -> F,
+        callback: fn(Arc<xitca_postgres::Client>, Statement, Vec<ToSqlHelper>) -> F,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
         T: QueryFragment<diesel::pg::Pg> + QueryId,
@@ -448,7 +453,7 @@ impl AsyncPgConnection {
 
     fn with_prepared_statement_after_sql_built<'a, F, R>(
         &mut self,
-        callback: fn(Arc<tokio_postgres::Client>, Statement, Vec<ToSqlHelper>) -> F,
+        callback: fn(Arc<xitca_postgres::Client>, Statement, Vec<ToSqlHelper>) -> F,
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<std::any::TypeId>,
         to_sql_result: QueryResult<()>,
@@ -751,30 +756,46 @@ where
 async fn lookup_type(
     schema: Option<String>,
     type_name: String,
-    raw_connection: &tokio_postgres::Client,
+    raw_connection: &xitca_postgres::Client,
 ) -> QueryResult<(u32, u32)> {
-    let r = if let Some(schema) = schema.as_ref() {
-        raw_connection
-            .query_one(
+    let mut stream = if let Some(schema) = schema.as_ref() {
+        let stmt = raw_connection
+            .prepare(
                 "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
-             INNER JOIN pg_namespace ON pg_type.typnamespace = pg_namespace.oid \
-             WHERE pg_type.typname = $1 AND pg_namespace.nspname = $2 \
-             LIMIT 1",
-                &[&type_name, schema],
+        INNER JOIN pg_namespace ON pg_type.typnamespace = pg_namespace.oid \
+        WHERE pg_type.typname = $1 AND pg_namespace.nspname = $2 \
+        LIMIT 1",
+                &[],
             )
             .await
-            .map_err(ErrorHelper)?
+            .map_err(ErrorHelper)?;
+
+        let res = raw_connection
+            .query(stmt.as_ref(), &[&type_name, schema])
+            .map_err(ErrorHelper)?;
+
+        RowStreamOwned::from(res)
     } else {
-        raw_connection
-            .query_one(
+        let stmt = raw_connection
+            .prepare(
                 "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
              WHERE pg_type.oid = quote_ident($1)::regtype::oid \
              LIMIT 1",
-                &[&type_name],
+                &[],
             )
             .await
-            .map_err(ErrorHelper)?
+            .map_err(ErrorHelper)?;
+
+        let res = raw_connection
+            .query(stmt.as_ref(), &[&type_name])
+            .map_err(ErrorHelper)?;
+        RowStreamOwned::from(res)
     };
+    let r = stream
+        .try_next()
+        .await
+        .map_err(ErrorHelper)?
+        .ok_or_else(|| Error::NotFound)?;
     Ok((r.get(0), r.get(1)))
 }
 
@@ -804,7 +825,7 @@ fn replace_fake_oid(
 }
 
 async fn drive_future<R>(
-    connection_future: Option<broadcast::Receiver<Arc<tokio_postgres::Error>>>,
+    connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
     client_future: impl Future<Output = Result<R, diesel::result::Error>>,
 ) -> Result<R, diesel::result::Error> {
     if let Some(mut connection_future) = connection_future {
@@ -836,7 +857,7 @@ impl crate::pooled_connection::PoolableConnection for AsyncPgConnection {
     fn is_broken(&mut self) -> bool {
         use crate::TransactionManager;
 
-        Self::TransactionManager::is_broken_transaction_manager(self) || self.conn.is_closed()
+        Self::TransactionManager::is_broken_transaction_manager(self) || self.conn.closed()
     }
 }
 
