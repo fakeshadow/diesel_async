@@ -95,4 +95,4 @@ members = [
 ]
 
 [patch.crates-io]
-xitca-postgres = { git = "https://github.com/HFQR/xitca-web.git", rev = "c8ae537" }
+xitca-postgres = { git = "https://github.com/HFQR/xitca-web.git", rev = "4211ff2" }
