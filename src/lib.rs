@@ -119,34 +119,20 @@ pub trait SimpleAsyncConnection {
     async fn batch_execute(&mut self, query: &str) -> QueryResult<()>;
 }
 
-/// An async connection to a database
-///
-/// This trait represents a n async database connection. It can be used to query the database through
-/// the query dsl provided by diesel, custom extensions or raw sql queries. It essentially mirrors
-/// the sync diesel [`Connection`](diesel::connection::Connection) implementation
-#[async_trait::async_trait]
-pub trait AsyncConnection: SimpleAsyncConnection + Sized + Send {
-    /// The future returned by `AsyncConnection::execute`
-    type ExecuteFuture<'conn, 'query>: Future<Output = QueryResult<usize>> + Send;
-    /// The future returned by `AsyncConnection::load`
-    type LoadFuture<'conn, 'query>: Future<Output = QueryResult<Self::Stream<'conn, 'query>>> + Send;
-    /// The inner stream returned by `AsyncConnection::load`
-    type Stream<'conn, 'query>: Stream<Item = QueryResult<Self::Row<'conn, 'query>>> + Send;
-    /// The row type used by the stream returned by `AsyncConnection::load`
-    type Row<'conn, 'query>: Row<'conn, Self::Backend>;
-
-    /// The backend this type connects to
-    type Backend: Backend;
-
-    #[doc(hidden)]
-    type TransactionManager: TransactionManager<Self>;
-
+/// definition of creating an async connection to database
+pub trait AsyncEstablish: AsyncConnection {
     /// Establishes a new connection to the database
     ///
     /// The argument to this method and the method's behavior varies by backend.
     /// See the documentation for that backend's connection class
     /// for details about what it accepts and how it behaves.
-    async fn establish(database_url: &str) -> ConnectionResult<Self>;
+    fn establish(database_url: &str) -> impl Future<Output = ConnectionResult<Self>> + Send;
+}
+
+/// definition of starting a transaction to database
+pub trait AsyncTransaction: AsyncConnection {
+    #[doc(hidden)]
+    type TransactionManager: TransactionManager<Self>;
 
     /// Executes the given function inside of a database transaction
     ///
@@ -225,34 +211,36 @@ pub trait AsyncConnection: SimpleAsyncConnection + Sized + Send {
     /// #     Ok(())
     /// # }
     /// ```
-    async fn transaction<'a, R, E, F>(&mut self, callback: F) -> Result<R, E>
+    fn transaction<'a, R, E, F>(&mut self, callback: F) -> impl Future<Output = Result<R, E>> + Send
     where
         F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
         E: From<diesel::result::Error> + Send + 'a,
         R: Send + 'a,
     {
-        Self::TransactionManager::transaction(self, callback).await
+        async { Self::TransactionManager::transaction(self, callback).await }
     }
 
     /// Creates a transaction that will never be committed. This is useful for
     /// tests. Panics if called while inside of a transaction or
     /// if called with a connection containing a broken transaction
-    async fn begin_test_transaction(&mut self) -> QueryResult<()> {
+    fn begin_test_transaction(&mut self) -> impl Future<Output = QueryResult<()>> + Send {
         use diesel::connection::TransactionManagerStatus;
-
-        match Self::TransactionManager::transaction_manager_status_mut(self) {
-            TransactionManagerStatus::Valid(valid_status) => {
-                assert_eq!(None, valid_status.transaction_depth())
-            }
-            TransactionManagerStatus::InError => panic!("Transaction manager in error"),
-        };
-        Self::TransactionManager::begin_transaction(self).await?;
-        // set the test transaction flag
-        // to prevent that this connection gets dropped in connection pools
-        // Tests commonly set the poolsize to 1 and use `begin_test_transaction`
-        // to prevent modifications to the schema
-        Self::TransactionManager::transaction_manager_status_mut(self).set_test_transaction_flag();
-        Ok(())
+        async {
+            match Self::TransactionManager::transaction_manager_status_mut(self) {
+                TransactionManagerStatus::Valid(valid_status) => {
+                    assert_eq!(None, valid_status.transaction_depth())
+                }
+                TransactionManagerStatus::InError => panic!("Transaction manager in error"),
+            };
+            Self::TransactionManager::begin_transaction(self).await?;
+            // set the test transaction flag
+            // to prevent that this connection gets dropped in connection pools
+            // Tests commonly set the poolsize to 1 and use `begin_test_transaction`
+            // to prevent modifications to the schema
+            Self::TransactionManager::transaction_manager_status_mut(self)
+                .set_test_transaction_flag();
+            Ok(())
+        }
     }
 
     /// Executes the given function inside a transaction, but does not commit
@@ -292,28 +280,58 @@ pub trait AsyncConnection: SimpleAsyncConnection + Sized + Send {
     /// #     Ok(())
     /// # }
     /// ```
-    async fn test_transaction<'a, R, E, F>(&'a mut self, f: F) -> R
+    fn test_transaction<'a, R, E, F>(
+        &'a mut self,
+        f: F,
+    ) -> std::pin::Pin<Box<dyn Future<Output = R> + '_>>
     where
         F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
         E: Debug + Send + 'a,
         R: Send + 'a,
         Self: 'a,
     {
-        use futures_util::TryFutureExt;
+        Box::pin(async {
+            use futures_util::TryFutureExt;
 
-        let mut user_result = None;
-        let _ = self
-            .transaction::<R, _, _>(|c| {
-                f(c).map_err(|_| Error::RollbackTransaction)
-                    .and_then(|r| {
-                        user_result = Some(r);
-                        futures_util::future::ready(Err(Error::RollbackTransaction))
-                    })
-                    .scope_boxed()
-            })
-            .await;
-        user_result.expect("Transaction did not succeed")
+            let mut user_result = None;
+            let _ = self
+                .transaction::<R, _, _>(|c| {
+                    f(c).map_err(|_| Error::RollbackTransaction)
+                        .and_then(|r| {
+                            user_result = Some(r);
+                            futures_util::future::ready(Err(Error::RollbackTransaction))
+                        })
+                        .scope_boxed()
+                })
+                .await;
+            user_result.expect("Transaction did not succeed")
+        })
     }
+
+    #[doc(hidden)]
+    fn transaction_state(
+        &mut self,
+    ) -> &mut <Self::TransactionManager as TransactionManager<Self>>::TransactionStateData;
+}
+
+/// An async connection to a database
+///
+/// This trait represents a n async database connection. It can be used to query the database through
+/// the query dsl provided by diesel, custom extensions or raw sql queries. It essentially mirrors
+/// the sync diesel [`Connection`](diesel::connection::Connection) implementation
+#[async_trait::async_trait]
+pub trait AsyncConnection: SimpleAsyncConnection + Sized + Send {
+    /// The future returned by `AsyncConnection::execute`
+    type ExecuteFuture<'conn, 'query>: Future<Output = QueryResult<usize>> + Send;
+    /// The future returned by `AsyncConnection::load`
+    type LoadFuture<'conn, 'query>: Future<Output = QueryResult<Self::Stream<'conn, 'query>>> + Send;
+    /// The inner stream returned by `AsyncConnection::load`
+    type Stream<'conn, 'query>: Stream<Item = QueryResult<Self::Row<'conn, 'query>>> + Send;
+    /// The row type used by the stream returned by `AsyncConnection::load`
+    type Row<'conn, 'query>: Row<'conn, Self::Backend>;
+
+    /// The backend this type connects to
+    type Backend: Backend;
 
     #[doc(hidden)]
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
@@ -328,11 +346,6 @@ pub trait AsyncConnection: SimpleAsyncConnection + Sized + Send {
     ) -> Self::ExecuteFuture<'conn, 'query>
     where
         T: QueryFragment<Self::Backend> + QueryId + 'query;
-
-    #[doc(hidden)]
-    fn transaction_state(
-        &mut self,
-    ) -> &mut <Self::TransactionManager as TransactionManager<Self>>::TransactionStateData;
 
     // These functions allow the associated types (`ExecuteFuture`, `LoadFuture`, etc.) to
     // compile without a `where Self: '_` clause. This is needed the because bound causes

@@ -102,6 +102,8 @@ pub use self::implementation::AsyncConnectionWrapper;
 mod implementation {
     use diesel::connection::{Instrumentation, SimpleConnection};
 
+    use crate::{AsyncEstablish, AsyncTransaction};
+
     use super::*;
 
     pub struct AsyncConnectionWrapper<C, B> {
@@ -137,7 +139,7 @@ mod implementation {
 
     impl<C, B> diesel::connection::Connection for AsyncConnectionWrapper<C, B>
     where
-        C: crate::AsyncConnection,
+        C: AsyncEstablish + AsyncTransaction,
         B: BlockOn + Send,
     {
         type Backend = C::Backend;
@@ -176,7 +178,7 @@ mod implementation {
 
     impl<C, B> diesel::connection::LoadConnection for AsyncConnectionWrapper<C, B>
     where
-        C: crate::AsyncConnection,
+        C: AsyncEstablish + AsyncTransaction,
         B: BlockOn + Send,
     {
         type Cursor<'conn, 'query> = AsyncCursorWrapper<'conn, C::Stream<'conn, 'query>, B>
@@ -231,7 +233,7 @@ mod implementation {
     impl<C, B> diesel::connection::TransactionManager<AsyncConnectionWrapper<C, B>>
         for AsyncConnectionWrapperTransactionManagerWrapper
     where
-        C: crate::AsyncConnection,
+        C: AsyncEstablish + AsyncTransaction,
         B: BlockOn + Send,
     {
         type TransactionStateData =

@@ -1,4 +1,4 @@
-use crate::{AnsiTransactionManager, AsyncConnection, TransactionManager};
+use crate::{AnsiTransactionManager, AsyncTransaction, TransactionManager};
 use diesel::backend::Backend;
 use diesel::pg::Pg;
 use diesel::query_builder::{AstPass, QueryBuilder, QueryFragment};
@@ -25,7 +25,7 @@ pub struct TransactionBuilder<'a, C> {
 
 impl<'a, C> TransactionBuilder<'a, C>
 where
-    C: AsyncConnection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
+    C: AsyncTransaction<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
     pub(crate) fn new(connection: &'a mut C) -> Self {
         Self {
@@ -379,6 +379,8 @@ impl QueryFragment<Pg> for Deferrable {
 
 #[cfg(test)]
 mod tests {
+    use crate::AsyncEstablish;
+
     use super::*;
 
     #[tokio::test]
@@ -395,7 +397,7 @@ mod tests {
         let database_url =
             dbg!(std::env::var("DATABASE_URL")
                 .expect("DATABASE_URL must be set in order to run tests"));
-        let mut conn = crate::AsyncPgConnection::establish(&database_url)
+        let mut conn = crate::pg::AsyncPgConnection::establish(&database_url)
             .await
             .unwrap();
 

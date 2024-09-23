@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::num::NonZeroU32;
 
 use crate::AsyncConnection;
+use crate::AsyncTransaction;
 // TODO: refactor this to share more code with diesel
 
 /// Manages the internal transaction state for a connection.
@@ -260,7 +261,7 @@ impl AnsiTransactionManager {
         conn: &mut Conn,
     ) -> QueryResult<&mut ValidTransactionManagerStatus>
     where
-        Conn: AsyncConnection<TransactionManager = Self>,
+        Conn: AsyncTransaction<TransactionManager = Self>,
     {
         conn.transaction_state().status.transaction_state()
     }
@@ -272,7 +273,7 @@ impl AnsiTransactionManager {
     /// Returns an error if already inside of a transaction.
     pub async fn begin_transaction_sql<Conn>(conn: &mut Conn, sql: &str) -> QueryResult<()>
     where
-        Conn: AsyncConnection<TransactionManager = Self>,
+        Conn: AsyncTransaction<TransactionManager = Self>,
     {
         let state = Self::get_transaction_state(conn)?;
         match state.transaction_depth() {
@@ -290,7 +291,7 @@ impl AnsiTransactionManager {
 #[async_trait::async_trait]
 impl<Conn> TransactionManager<Conn> for AnsiTransactionManager
 where
-    Conn: AsyncConnection<TransactionManager = Self>,
+    Conn: AsyncTransaction<TransactionManager = Self>,
 {
     type TransactionStateData = Self;
 

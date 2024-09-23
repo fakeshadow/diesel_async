@@ -1,5 +1,8 @@
 use crate::stmt_cache::{PrepareCallback, StmtCache};
-use crate::{AnsiTransactionManager, AsyncConnection, SimpleAsyncConnection};
+use crate::{
+    AnsiTransactionManager, AsyncConnection, AsyncConnectionEstablish, AsyncConnectionTransaction,
+    SimpleAsyncConnection,
+};
 use diesel::connection::statement_cache::{MaybeCached, StatementCacheKey};
 use diesel::connection::Instrumentation;
 use diesel::connection::InstrumentationEvent;
@@ -61,16 +64,7 @@ const CONNECTION_SETUP_QUERIES: &[&str] = &[
     "SET character_set_results = 'utf8mb4'",
 ];
 
-#[async_trait::async_trait]
-impl AsyncConnection for AsyncMysqlConnection {
-    type ExecuteFuture<'conn, 'query> = BoxFuture<'conn, QueryResult<usize>>;
-    type LoadFuture<'conn, 'query> = BoxFuture<'conn, QueryResult<Self::Stream<'conn, 'query>>>;
-    type Stream<'conn, 'query> = BoxStream<'conn, QueryResult<Self::Row<'conn, 'query>>>;
-    type Row<'conn, 'query> = MysqlRow;
-    type Backend = Mysql;
-
-    type TransactionManager = AnsiTransactionManager;
-
+impl AsyncConnectionEstablish for AsyncMysqlConnection {
     async fn establish(database_url: &str) -> diesel::ConnectionResult<Self> {
         let mut instrumentation = diesel::connection::get_default_instrumentation();
         instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
@@ -85,6 +79,23 @@ impl AsyncConnection for AsyncMysqlConnection {
         conn.instrumentation = std::sync::Mutex::new(instrumentation);
         Ok(conn)
     }
+}
+
+impl AsyncConnectionTransaction for AsyncMysqlConnection {
+    type TransactionManager = AnsiTransactionManager;
+
+    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
+        &mut self.transaction_manager
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncConnection for AsyncMysqlConnection {
+    type ExecuteFuture<'conn, 'query> = BoxFuture<'conn, QueryResult<usize>>;
+    type LoadFuture<'conn, 'query> = BoxFuture<'conn, QueryResult<Self::Stream<'conn, 'query>>>;
+    type Stream<'conn, 'query> = BoxStream<'conn, QueryResult<Self::Row<'conn, 'query>>>;
+    type Row<'conn, 'query> = MysqlRow;
+    type Backend = Mysql;
 
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
@@ -167,10 +178,6 @@ impl AsyncConnection for AsyncMysqlConnection {
             }
             Ok(conn.affected_rows() as usize)
         })
-    }
-
-    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
-        &mut self.transaction_manager
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {

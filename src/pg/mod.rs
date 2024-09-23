@@ -8,7 +8,10 @@ use self::error_helper::ErrorHelper;
 use self::row::PgRow;
 use self::serialize::ToSqlHelper;
 use crate::stmt_cache::{PrepareCallback, StmtCache};
-use crate::{AnsiTransactionManager, AsyncConnection, SimpleAsyncConnection};
+use crate::{
+    AnsiTransactionManager, AsyncConnection, AsyncEstablish, AsyncTransaction,
+    SimpleAsyncConnection,
+};
 use diesel::connection::statement_cache::{PrepareForCache, StatementCacheKey};
 use diesel::connection::Instrumentation;
 use diesel::connection::InstrumentationEvent;
@@ -152,15 +155,7 @@ impl SimpleAsyncConnection for AsyncPgConnection {
     }
 }
 
-#[async_trait::async_trait]
-impl AsyncConnection for AsyncPgConnection {
-    type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
-    type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
-    type Stream<'conn, 'query> = BoxStream<'static, QueryResult<PgRow>>;
-    type Row<'conn, 'query> = PgRow;
-    type Backend = diesel::pg::Pg;
-    type TransactionManager = AnsiTransactionManager;
-
+impl AsyncEstablish for AsyncPgConnection {
     async fn establish(database_url: &str) -> ConnectionResult<Self> {
         let mut instrumentation = diesel::connection::get_default_instrumentation();
         instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
@@ -190,6 +185,30 @@ impl AsyncConnection for AsyncPgConnection {
             ));
         r
     }
+}
+
+impl AsyncTransaction for AsyncPgConnection {
+    type TransactionManager = AnsiTransactionManager;
+
+    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
+        // there should be no other pending future when this is called
+        // that means there is only one instance of this arc and
+        // we can simply access the inner data
+        if let Some(tm) = Arc::get_mut(&mut self.transaction_state) {
+            tm.get_mut()
+        } else {
+            panic!("Cannot access shared transaction state")
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncConnection for AsyncPgConnection {
+    type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
+    type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
+    type Stream<'conn, 'query> = BoxStream<'static, QueryResult<PgRow>>;
+    type Row<'conn, 'query> = PgRow;
+    type Backend = diesel::pg::Pg;
 
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
@@ -211,17 +230,6 @@ impl AsyncConnection for AsyncPgConnection {
     {
         let execute = self.with_prepared_statement(source, execute_prepared);
         self.run_with_connection_future(execute)
-    }
-
-    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
-        // there should be no other pending future when this is called
-        // that means there is only one instance of this arc and
-        // we can simply access the inner data
-        if let Some(tm) = Arc::get_mut(&mut self.transaction_state) {
-            tm.get_mut()
-        } else {
-            panic!("Cannot access shared transaction state")
-        }
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {

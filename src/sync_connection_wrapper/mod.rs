@@ -7,7 +7,9 @@
 //! * using a sync Connection implementation in async context
 //! * using the same code base for async crates needing multiple backends
 
-use crate::{AsyncConnection, SimpleAsyncConnection, TransactionManager};
+use crate::{
+    AsyncConnection, AsyncEstablish, AsyncTransaction, SimpleAsyncConnection, TransactionManager,
+};
 use diesel::backend::{Backend, DieselReserveSpecialization};
 use diesel::connection::Instrumentation;
 use diesel::connection::{
@@ -89,6 +91,58 @@ where
     }
 }
 
+impl<C, MD, O> AsyncEstablish for SyncConnectionWrapper<C>
+where
+    // Backend bounds
+    <C as Connection>::Backend: std::default::Default + DieselReserveSpecialization,
+    <C::Backend as Backend>::QueryBuilder: std::default::Default,
+    // Connection bounds
+    C: Connection + LoadConnection + WithMetadataLookup + 'static,
+    <C as Connection>::TransactionManager: Send,
+    // BindCollector bounds
+    MD: Send + 'static,
+    for<'a> <C::Backend as Backend>::BindCollector<'a>:
+        MoveableBindCollector<C::Backend, BindData = MD> + std::default::Default,
+    // Row bounds
+    O: 'static + Send + for<'conn> diesel::row::Row<'conn, C::Backend>,
+    for<'conn, 'query> <C as LoadConnection>::Row<'conn, 'query>:
+        IntoOwnedRow<'conn, <C as Connection>::Backend, OwnedRow = O>,
+{
+    async fn establish(database_url: &str) -> ConnectionResult<Self> {
+        let database_url = database_url.to_string();
+        tokio::task::spawn_blocking(move || C::establish(&database_url))
+            .await
+            .unwrap_or_else(|e| Err(diesel::ConnectionError::BadConnection(e.to_string())))
+            .map(|c| SyncConnectionWrapper::new(c))
+    }
+}
+
+impl<C, MD, O> AsyncTransaction for SyncConnectionWrapper<C>
+where
+    // Backend bounds
+    <C as Connection>::Backend: std::default::Default + DieselReserveSpecialization,
+    <C::Backend as Backend>::QueryBuilder: std::default::Default,
+    // Connection bounds
+    C: Connection + LoadConnection + WithMetadataLookup + 'static,
+    <C as Connection>::TransactionManager: Send,
+    // BindCollector bounds
+    MD: Send + 'static,
+    for<'a> <C::Backend as Backend>::BindCollector<'a>:
+        MoveableBindCollector<C::Backend, BindData = MD> + std::default::Default,
+    // Row bounds
+    O: 'static + Send + for<'conn> diesel::row::Row<'conn, C::Backend>,
+    for<'conn, 'query> <C as LoadConnection>::Row<'conn, 'query>:
+        IntoOwnedRow<'conn, <C as Connection>::Backend, OwnedRow = O>,
+{
+    type TransactionManager = SyncTransactionManagerWrapper<<C as Connection>::TransactionManager>;
+
+    fn transaction_state(
+        &mut self,
+    ) -> &mut <Self::TransactionManager as TransactionManager<Self>>::TransactionStateData {
+        self.exclusive_connection().transaction_state()
+    }
+}
+
 #[async_trait::async_trait]
 impl<C, MD, O> AsyncConnection for SyncConnectionWrapper<C>
 where
@@ -112,15 +166,6 @@ where
     type Stream<'conn, 'query> = BoxStream<'static, QueryResult<Self::Row<'conn, 'query>>>;
     type Row<'conn, 'query> = O;
     type Backend = <C as Connection>::Backend;
-    type TransactionManager = SyncTransactionManagerWrapper<<C as Connection>::TransactionManager>;
-
-    async fn establish(database_url: &str) -> ConnectionResult<Self> {
-        let database_url = database_url.to_string();
-        tokio::task::spawn_blocking(move || C::establish(&database_url))
-            .await
-            .unwrap_or_else(|e| Err(diesel::ConnectionError::BadConnection(e.to_string())))
-            .map(|c| SyncConnectionWrapper::new(c))
-    }
 
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
@@ -153,12 +198,6 @@ where
         T: QueryFragment<Self::Backend> + QueryId,
     {
         self.execute_with_prepared_query(source, |conn, query| conn.execute_returning_count(&query))
-    }
-
-    fn transaction_state(
-        &mut self,
-    ) -> &mut <Self::TransactionManager as TransactionManager<Self>>::TransactionStateData {
-        self.exclusive_connection().transaction_state()
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
@@ -362,7 +401,7 @@ impl<C> SyncConnectionWrapper<C> {
 ))]
 impl<C> crate::pooled_connection::PoolableConnection for SyncConnectionWrapper<C>
 where
-    Self: AsyncConnection,
+    Self: AsyncTransaction,
 {
     fn is_broken(&mut self) -> bool {
         Self::TransactionManager::is_broken_transaction_manager(self)

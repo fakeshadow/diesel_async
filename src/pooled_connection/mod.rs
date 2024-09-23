@@ -5,7 +5,7 @@
 //! * [deadpool](self::deadpool)
 //! * [bb8](self::bb8)
 //! * [mobc](self::mobc)
-use crate::{AsyncConnection, SimpleAsyncConnection};
+use crate::{AsyncConnection, AsyncEstablish, AsyncTransaction, SimpleAsyncConnection};
 use crate::{TransactionManager, UpdateAndFetchResults};
 use diesel::associations::HasTable;
 use diesel::connection::Instrumentation;
@@ -103,7 +103,7 @@ pub struct ManagerConfig<C> {
 
 impl<C> Default for ManagerConfig<C>
 where
-    C: AsyncConnection + 'static,
+    C: AsyncEstablish + 'static,
 {
     fn default() -> Self {
         Self {
@@ -137,7 +137,7 @@ impl<C> fmt::Debug for AsyncDieselConnectionManager<C> {
 
 impl<C> AsyncDieselConnectionManager<C>
 where
-    C: AsyncConnection + 'static,
+    C: AsyncEstablish + 'static,
 {
     /// Returns a new connection manager,
     /// which establishes connections to the given database URL.
@@ -176,6 +176,24 @@ where
     }
 }
 
+impl<C> AsyncTransaction for C
+where
+    C: DerefMut + Send,
+    C::Target: AsyncTransaction,
+{
+    type TransactionManager =
+        PoolTransactionManager<<C::Target as AsyncTransaction>::TransactionManager>;
+
+    fn transaction_state(&mut self) -> &mut <Self::TransactionManager as crate::transaction_manager::TransactionManager<Self>>::TransactionStateData{
+        let conn = self.deref_mut();
+        conn.transaction_state()
+    }
+
+    async fn begin_test_transaction(&mut self) -> diesel::QueryResult<()> {
+        self.deref_mut().begin_test_transaction().await
+    }
+}
+
 #[async_trait::async_trait]
 impl<C> AsyncConnection for C
 where
@@ -189,15 +207,6 @@ where
     type Row<'conn, 'query> = <C::Target as AsyncConnection>::Row<'conn, 'query>;
 
     type Backend = <C::Target as AsyncConnection>::Backend;
-
-    type TransactionManager =
-        PoolTransactionManager<<C::Target as AsyncConnection>::TransactionManager>;
-
-    async fn establish(_database_url: &str) -> diesel::ConnectionResult<Self> {
-        Err(diesel::result::ConnectionError::BadConnection(
-            String::from("Cannot directly establish a pooled connection"),
-        ))
-    }
 
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
@@ -223,17 +232,6 @@ where
         conn.execute_returning_count(source)
     }
 
-    fn transaction_state(
-        &mut self,
-    ) -> &mut <Self::TransactionManager as crate::transaction_manager::TransactionManager<Self>>::TransactionStateData{
-        let conn = self.deref_mut();
-        conn.transaction_state()
-    }
-
-    async fn begin_test_transaction(&mut self) -> diesel::QueryResult<()> {
-        self.deref_mut().begin_test_transaction().await
-    }
-
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
         self.deref_mut().instrumentation()
     }
@@ -251,7 +249,7 @@ pub struct PoolTransactionManager<TM>(std::marker::PhantomData<TM>);
 impl<C, TM> TransactionManager<C> for PoolTransactionManager<TM>
 where
     C: DerefMut + Send,
-    C::Target: AsyncConnection<TransactionManager = TM>,
+    C::Target: AsyncTransaction<TransactionManager = TM>,
     TM: TransactionManager<C::Target>,
 {
     type TransactionStateData = TM::TransactionStateData;
@@ -318,7 +316,7 @@ impl<C> diesel::query_dsl::RunQueryDsl<C> for CheckConnectionQuery {}
 
 #[doc(hidden)]
 #[async_trait::async_trait]
-pub trait PoolableConnection: AsyncConnection {
+pub trait PoolableConnection: AsyncTransaction {
     /// Check if a connection is still valid
     ///
     /// The default implementation will perform a check based on the provided
